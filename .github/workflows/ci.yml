@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Lint (ruff)
+        run: |
+          set -o pipefail
+          { ruff check . && ruff format --check . ; } 2>&1 | tee lint.log
+      - name: Test with coverage
+        run: |
+          set -o pipefail
+          pytest --cov=app --cov=scripts --cov-report=term-missing --cov-report=xml 2>&1 | tee pytest.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ci-logs
+          path: |
+            lint.log
+            pytest.log
+            coverage.xml
+          if-no-files-found: ignore
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: lint-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t ai-cicd-sample:${{ github.sha }} .
+      - name: Smoke test
+        run: |
+          docker run -d --name app -p 8000:8000 ai-cicd-sample:${{ github.sha }}
+          for i in $(seq 1 20); do curl -fs localhost:8000/health && exit 0; sleep 1; done
+          docker logs app; exit 1
+
+  ai-failure-analysis:
+    runs-on: ubuntu-latest
+    needs: lint-test
+    if: failure()
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-logs
+          path: logs
+        continue-on-error: true
+      - name: AI failure analysis
+        env:
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_BASE_URL: ${{ vars.AI_BASE_URL }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python scripts/ai/ai_failure_analysis.py logs/lint.log logs/pytest.log
